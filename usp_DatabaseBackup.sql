@@ -1,77 +1,71 @@
-
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
-GO
-
--- =============================================
--- Author:      [Nilesh Golakia/ngolakia]
--- Create date: 2026-03-31
--- Description: Performance-focused backup orchestration for Full, Diff, and Log.
--- Features:    Auto-compression, dynamic pathing, and integrated error logging.
--- =============================================
-
-CREATE PROCEDURE [dbo].[usp_DatabaseBackup]
-    @DatabaseName NVARCHAR(255),
-    @BackupType NVARCHAR(10) = 'FULL', -- FULL, DIFF, or LOG
+ALTER PROCEDURE [dbo].[usp_DatabaseBackup]
+    @DatabaseName   NVARCHAR(255),
+    @BackupType     NVARCHAR(10) = 'FULL', 
     @BackupDirectory NVARCHAR(500),
-    @Compress BIT = 1,
-    @Verify BIT = 1
+    @Compress       BIT = 1,
+    @Verify         BIT = 1
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Timestamp NVARCHAR(20) = REPLACE(REPLACE(REPLACE(CONVERT(NVARCHAR(20), GETDATE(), 120), '-', ''), ' ', '_'), ':', '');
-    DECLARE @FilePath NVARCHAR(1000);
-    DECLARE @FileExtension NVARCHAR(5);
-    DECLARE @SQL NVARCHAR(MAX);
+    DECLARE @Timestamp NVARCHAR(20) = FORMAT(GETDATE(), 'yyyyMMdd_HHmmss');
+    DECLARE @FilePath  NVARCHAR(1000);
+    DECLARE @Ext       NVARCHAR(5) = CASE @BackupType WHEN 'FULL' THEN 'bak' WHEN 'DIFF' THEN 'diff' WHEN 'LOG' THEN 'trn' ELSE 'bak' END;
+    DECLARE @SQL       NVARCHAR(MAX);
+    DECLARE @CommandLogID INT;
     DECLARE @StartTime DATETIME = GETDATE();
 
-    
-    SET @FileExtension = CASE 
-        WHEN @BackupType = 'FULL' THEN 'bak'
-        WHEN @BackupType = 'DIFF' THEN 'diff'
-        WHEN @BackupType = 'LOG'  THEN 'trn'
-        ELSE 'bak'
-    END;
+    -- Path Sanitization
+    IF RIGHT(@BackupDirectory, 1) <> '\' SET @BackupDirectory = @BackupDirectory + '\';
+    SET @FilePath = @BackupDirectory + @DatabaseName + '_' + @BackupType + '_' + @Timestamp + '.' + @Ext;
 
+    -- Build Base Command
+    IF @BackupType = 'LOG'
+        SET @SQL = 'BACKUP LOG ' + QUOTENAME(@DatabaseName) + ' TO DISK = ' + QUOTENAME(@FilePath, '''');
+    ELSE
+        SET @SQL = 'BACKUP DATABASE ' + QUOTENAME(@DatabaseName) + ' TO DISK = ' + QUOTENAME(@FilePath, '''');
+
+    -- Build WITH Options
+    DECLARE @WithOptions NVARCHAR(MAX) = '';
+    IF @BackupType = 'DIFF' SET @WithOptions = @WithOptions + ', DIFFERENTIAL';
+    IF @Compress = 1       SET @WithOptions = @WithOptions + ', COMPRESSION';
+    SET @WithOptions = @WithOptions + ', CHECKSUM, STATS = 10';
+    SET @SQL = @SQL + ' WITH ' + STUFF(@WithOptions, 1, 2, '');
+
+    -- Initial Log Entry (Status: RUNNING)
+    INSERT INTO [dbo].[CommandLog] (DatabaseName, CommandType, Command, StartTime, Status)
+    VALUES (@DatabaseName, @BackupType, @SQL, @StartTime, 'RUNNING');
     
-    -- Format: Directory\DatabaseName_Type_YYYYMMDD_HHMMSS.ext
-    SET @FilePath = @BackupDirectory + '\' + @DatabaseName + '_' + @BackupType + '_' + @Timestamp + '.' + @FileExtension;
+    SET @CommandLogID = SCOPE_IDENTITY();
 
     BEGIN TRY
-        
-        SET @SQL = CASE 
-            WHEN @BackupType = 'LOG' 
-                THEN 'BACKUP LOG [' + @DatabaseName + '] TO DISK = ''' + @FilePath + ''''
-            ELSE 'BACKUP DATABASE [' + @DatabaseName + '] TO DISK = ''' + @FilePath + ''''
-        END;
-
-        
-        IF @BackupType = 'DIFF' SET @SQL = @SQL + ' WITH DIFFERENTIAL';
-
-        -- Add Compression & Verification
-        IF @Compress = 1 AND @BackupType <> 'LOG' 
-            SET @SQL = @SQL + CASE WHEN @BackupType = 'DIFF' THEN ', COMPRESSION' ELSE ' WITH COMPRESSION' END;
-        
-        IF @Verify = 1 
-            SET @SQL = @SQL + '; RESTORE VERIFYONLY FROM DISK = ''' + @FilePath + ''';';
-
-        
-        -- In a real setup, we pass this to our internal engine for logging
+        -- Execute Backup
         EXEC sp_executesql @SQL;
 
-        
-        PRINT 'Backup Successful: ' + @FilePath;
-        
+        -- Optional Verification
+        IF @Verify = 1
+        BEGIN
+            DECLARE @VerifySQL NVARCHAR(MAX) = 'RESTORE VERIFYONLY FROM DISK = ' + QUOTENAME(@FilePath, '''');
+            EXEC sp_executesql @VerifySQL;
+        END
+
+        -- Update Log on Success
+        UPDATE [dbo].[CommandLog] 
+        SET EndTime = GETDATE(), Status = 'SUCCESS' 
+        WHERE ID = @CommandLogID;
+
+        PRINT 'SUCCESS: ' + @BackupType + ' backup completed.';
     END TRY
     BEGIN CATCH
-        -- Error Handling
-        DECLARE @ErrorMessage NVARCHAR(4000) = ERROR_MESSAGE();
-        PRINT 'Backup Failed for ' + @DatabaseName + '. Error: ' + @ErrorMessage;
-        
-        -- You would typically call usp_LogMaintenance here
-        RAISERROR(@ErrorMessage, 16, 1);
+        -- Update Log on Failure
+        UPDATE [dbo].[CommandLog] 
+        SET EndTime = GETDATE(), 
+            Status = 'FAILURE', 
+            ErrorMessage = ERROR_MESSAGE() 
+        WHERE ID = @CommandLogID;
+
+        DECLARE @ErrorMsg NVARCHAR(4000) = ERROR_MESSAGE();
+        RAISERROR(@ErrorMsg, 16, 1);
     END CATCH
 END
 GO
