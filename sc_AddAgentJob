@@ -1,0 +1,44 @@
+USE [msdb];
+GO
+
+DECLARE @JobName NVARCHAR(128) = N'Maintenance_Master_Package';
+DECLARE @TargetDB NVARCHAR(128) = N'AdminDB'; -- The DB where your procs live
+DECLARE @EmailRecipient NVARCHAR(255) = N'nilesh@example.com';
+
+-- 1. Create the Job
+IF EXISTS (SELECT job_id FROM msdb.dbo.sysjobs WHERE name = @JobName)
+    EXEC sp_delete_job @job_name = @JobName;
+
+EXEC sp_add_job @job_name = @JobName, @enabled = 1, @description = N'Full Maintenance Suite with Alerting';
+
+-- 2. Step: Database Backups
+EXEC sp_add_jobstep @job_name = @JobName, @step_name = N'Database Backups',
+    @subsystem = N'TSQL', @database_name = @TargetDB,
+    @command = N'EXEC dbo.DatabaseBackup @Databases = ''USER_DATABASES'', @BackupType = ''FULL'', @Checksum = ''Y''',
+    @on_success_action = 3, -- Go to next step
+    @on_fail_action = 3;    -- Go to next step (Crucial: Don't stop on error!)
+
+-- 3. Step: Index Optimization
+EXEC sp_add_jobstep @job_name = @JobName, @step_name = N'Index Optimization',
+    @subsystem = N'TSQL', @database_name = @TargetDB,
+    @command = N'EXEC dbo.IndexOptimize @Databases = ''USER_DATABASES'', @FragmentationLow = NULL, @FragmentationMedium = ''INDEX_REORGANIZE'', @FragmentationHigh = ''INDEX_REBUILD_ONLINE''',
+    @on_success_action = 3,
+    @on_fail_action = 3;
+
+-- 4. Step: Integrity Checks
+EXEC sp_add_jobstep @job_name = @JobName, @step_name = N'Integrity Checks',
+    @subsystem = N'TSQL', @database_name = @TargetDB,
+    @command = N'EXEC dbo.DatabaseIntegrityCheck @Databases = ''USER_DATABASES''',
+    @on_success_action = 3,
+    @on_fail_action = 3;
+
+-- 5. Step: Intelligent Alerting (The Reporter)
+EXEC sp_add_jobstep @job_name = @JobName, @step_name = N'Reporting and Alerting',
+    @subsystem = N'TSQL', @database_name = @TargetDB,
+    @command = N'EXEC dbo.usp_MaintenanceAlerting @Recipients = ''' + @EmailRecipient + ''', @ProfileName = ''Default''',
+    @on_success_action = 1, -- Quit with Success
+    @on_fail_action = 2;    -- Quit with Failure (If the mailer itself fails)
+
+-- 6. Target the Local Server
+EXEC sp_add_jobserver @job_name = @JobName, @server_name = N'(local)';
+GO
